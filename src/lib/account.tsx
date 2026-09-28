@@ -69,15 +69,32 @@ export type RecentPlace = PlaceSummary & {
   viewedAtMs: number;
 };
 
-// "Notify me when a seat opens" for one place. Stored on users/{uid} as
-// seatWatches.{slug}; the Cloud Function removes it once it has notified you.
+// "Notify me when a seat opens". Stored on users/{uid} in seatWatches; the
+// Cloud Function removes each one once it has sent the notification.
+//
+// - Whole place:    seatWatches.{slug}
+// - One seat:       seatWatches.{slug|tableId|seatId}  (has tableId + seatId)
 export type SeatWatch = {
+  slug: string;
   businessId: string;
   placeName: string;
   // Group size: only notify when one table has this many free seats
   party: number;
   createdAtMs: number;
+  // Only for a specific seat
+  tableId?: string;
+  tableName?: string;
+  seatId?: string;
 };
+
+// A watch that hasn't expired yet
+function isFreshWatch(watch: SeatWatch | undefined): watch is SeatWatch {
+  return !!watch && Date.now() - watch.createdAtMs < SEAT_WATCH_TTL_MS;
+}
+
+export function seatWatchId(slug: string, tableId: string, seatId: string | number) {
+  return `${slug}|${tableId}|${seatId}`;
+}
 
 // Watches expire after 12 hours (same as the website's email alerts)
 export const SEAT_WATCH_TTL_MS = 12 * 60 * 60 * 1000;
@@ -111,16 +128,24 @@ function toSeatWatches(value: unknown): Record<string, SeatWatch> {
 
   const watches: Record<string, SeatWatch> = {};
 
-  Object.entries(value as Record<string, Record<string, unknown>>).forEach(([slug, watch]) => {
+  Object.entries(value as Record<string, Record<string, unknown>>).forEach(([key, watch]) => {
     if (!watch || typeof watch !== "object") {
       return;
     }
 
-    watches[slug] = {
+    watches[key] = {
+      slug: String(watch.slug || key),
       businessId: String(watch.businessId || ""),
       placeName: String(watch.placeName || ""),
       party: Math.max(1, Number(watch.party) || 1),
       createdAtMs: Number(watch.createdAtMs) || 0,
+      ...(watch.tableId
+        ? {
+            tableId: String(watch.tableId),
+            tableName: String(watch.tableName || ""),
+            seatId: String(watch.seatId ?? ""),
+          }
+        : {}),
     };
   });
 
@@ -148,14 +173,26 @@ type AccountContextValue = {
   usesPassword: boolean;
   // Permanently deletes the account and everything saved under it
   deleteAccount: (password: string) => Promise<void>;
-  // "Notify me when a seat opens"
+  // "Notify me when a seat opens" (whole place)
   isWatching: (slug: string) => boolean;
-  watchSeats: (
-    place: { slug: string; businessId: string; placeName: string },
-    party: number
-  ) => Promise<WatchResult>;
+  watchSeats: (place: WatchPlace, party: number) => Promise<WatchResult>;
   unwatchSeats: (slug: string, businessId: string) => Promise<void>;
+  // "Notify me when this seat opens" (one specific seat)
+  isWatchingSeat: (slug: string, tableId: string, seatId: string | number) => boolean;
+  watchSeat: (
+    place: WatchPlace,
+    table: { id: string; name: string },
+    seatId: string | number
+  ) => Promise<WatchResult>;
+  unwatchSeat: (
+    slug: string,
+    businessId: string,
+    tableId: string,
+    seatId: string | number
+  ) => Promise<void>;
 };
+
+type WatchPlace = { slug: string; businessId: string; placeName: string };
 
 const AccountContext = createContext<AccountContextValue | null>(null);
 
@@ -440,16 +477,20 @@ export function AccountProvider({ children }: { children: ReactNode }) {
   const isWatching = useCallback(
     (slug: string) => {
       const watch = profile.seatWatches[slug];
-      return !!watch && Date.now() - watch.createdAtMs < SEAT_WATCH_TTL_MS;
+      return isFreshWatch(watch) && !watch.tableId;
     },
     [profile.seatWatches]
   );
 
-  const watchSeats = useCallback(
-    async (
-      place: { slug: string; businessId: string; placeName: string },
-      party: number
-    ): Promise<WatchResult> => {
+  const isWatchingSeat = useCallback(
+    (slug: string, tableId: string, seatId: string | number) =>
+      isFreshWatch(profile.seatWatches[seatWatchId(slug, tableId, seatId)]),
+    [profile.seatWatches]
+  );
+
+  // Saves one watch (asks for notification permission first)
+  const saveWatch = useCallback(
+    async (key: string, watch: SeatWatch): Promise<WatchResult> => {
       if (!user) {
         return "signin";
       }
@@ -465,15 +506,8 @@ export function AccountProvider({ children }: { children: ReactNode }) {
           doc(db, "users", user.uid),
           {
             pushTokens: arrayUnion(push.token),
-            seatWatches: {
-              [place.slug]: {
-                businessId: place.businessId,
-                placeName: place.placeName,
-                party,
-                createdAtMs: Date.now(),
-              },
-            },
-            seatWatchBusinessIds: arrayUnion(place.businessId),
+            seatWatches: { [key]: watch },
+            seatWatchBusinessIds: arrayUnion(watch.businessId),
             updatedAt: serverTimestamp(),
           },
           { merge: true }
@@ -488,23 +522,76 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     [user]
   );
 
-  const unwatchSeats = useCallback(
-    async (slug: string, businessId: string) => {
+  // Removes one watch (and the place from the lookup list if it was the last one)
+  const removeWatch = useCallback(
+    async (key: string, businessId: string) => {
       if (!user) {
         return;
       }
 
-      await updateDoc(
-        doc(db, "users", user.uid),
-        new FieldPath("seatWatches", slug),
-        deleteField(),
-        "seatWatchBusinessIds",
-        arrayRemove(businessId),
-        "updatedAt",
-        serverTimestamp()
+      const othersForPlace = Object.entries(profile.seatWatches).some(
+        ([otherKey, watch]) => otherKey !== key && watch.businessId === businessId
       );
+
+      if (othersForPlace) {
+        await updateDoc(
+          doc(db, "users", user.uid),
+          new FieldPath("seatWatches", key),
+          deleteField(),
+          "updatedAt",
+          serverTimestamp()
+        );
+      } else {
+        await updateDoc(
+          doc(db, "users", user.uid),
+          new FieldPath("seatWatches", key),
+          deleteField(),
+          "seatWatchBusinessIds",
+          arrayRemove(businessId),
+          "updatedAt",
+          serverTimestamp()
+        );
+      }
     },
-    [user]
+    [user, profile.seatWatches]
+  );
+
+  const watchSeats = useCallback(
+    (place: WatchPlace, party: number) =>
+      saveWatch(place.slug, {
+        slug: place.slug,
+        businessId: place.businessId,
+        placeName: place.placeName,
+        party,
+        createdAtMs: Date.now(),
+      }),
+    [saveWatch]
+  );
+
+  const unwatchSeats = useCallback(
+    (slug: string, businessId: string) => removeWatch(slug, businessId),
+    [removeWatch]
+  );
+
+  const watchSeat = useCallback(
+    (place: WatchPlace, table: { id: string; name: string }, seatId: string | number) =>
+      saveWatch(seatWatchId(place.slug, table.id, seatId), {
+        slug: place.slug,
+        businessId: place.businessId,
+        placeName: place.placeName,
+        party: 1,
+        createdAtMs: Date.now(),
+        tableId: table.id,
+        tableName: table.name,
+        seatId: String(seatId),
+      }),
+    [saveWatch]
+  );
+
+  const unwatchSeat = useCallback(
+    (slug: string, businessId: string, tableId: string, seatId: string | number) =>
+      removeWatch(seatWatchId(slug, tableId, seatId), businessId),
+    [removeWatch]
   );
 
   const usesPassword =
@@ -581,6 +668,9 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       isWatching,
       watchSeats,
       unwatchSeats,
+      isWatchingSeat,
+      watchSeat,
+      unwatchSeat,
     }),
     [
       user,
@@ -600,6 +690,9 @@ export function AccountProvider({ children }: { children: ReactNode }) {
       isWatching,
       watchSeats,
       unwatchSeats,
+      isWatchingSeat,
+      watchSeat,
+      unwatchSeat,
     ]
   );
 

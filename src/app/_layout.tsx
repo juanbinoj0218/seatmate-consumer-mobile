@@ -32,10 +32,19 @@ export default function RootLayout() {
 
     handledId.current = id;
 
-    const slug = lastResponse.notification.request.content.data?.slug;
+    const data = lastResponse.notification.request.content.data ?? {};
+    const slug = data.slug;
+    const tableId = data.tableId;
 
     if (typeof slug === "string" && slug !== "") {
-      router.push({ pathname: "/place/[slug]", params: { slug } });
+      router.push({
+        pathname: "/place/[slug]",
+        // Seat alerts also open the table with that seat
+        params:
+          typeof tableId === "string" && tableId !== ""
+            ? { slug, table: tableId }
+            : { slug },
+      });
     }
   }, [lastResponse, router]);
 

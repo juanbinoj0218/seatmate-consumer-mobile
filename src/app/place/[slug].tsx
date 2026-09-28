@@ -335,8 +335,13 @@ export default function PlaceScreen() {
   // Index into ZOOM_LEVELS (0 = whole floor fits)
   const [zoomIndex, setZoomIndex] = useState(0);
 
-  // The table the customer tapped
-  const [selectedTableId, setSelectedTableId] = useState<string | null>(null);
+  // The table the customer tapped. A seat notification opens its table.
+  const [selectedTableId, setSelectedTableId] = useState<string | null>(() => {
+    const fromNotification = Array.isArray(params.table) ? params.table[0] : params.table;
+    return typeof fromNotification === "string" && fromNotification !== ""
+      ? fromNotification
+      : null;
+  });
 
   // Floor scrolling (used to keep the same spot in view when zooming)
   const horizontalScrollRef = useRef<ScrollView>(null);
@@ -363,6 +368,9 @@ export default function PlaceScreen() {
     isWatching,
     watchSeats,
     unwatchSeats,
+    isWatchingSeat,
+    watchSeat,
+    unwatchSeat,
   } = useAccount();
 
   // "Notify me when a seat opens"
@@ -826,6 +834,48 @@ export default function PlaceScreen() {
     }
   }
 
+  // "Notify me when this seat opens" (one specific seat)
+  const [busySeatKey, setBusySeatKey] = useState("");
+
+  async function toggleSeatWatch(table: Table, seat: Seat) {
+    if (!business) {
+      return;
+    }
+
+    if (!user) {
+      router.push("/login");
+      return;
+    }
+
+    const key = `${table.id}|${seat.id}`;
+
+    setWatchProblem("");
+    setBusySeatKey(key);
+
+    try {
+      if (isWatchingSeat(slug, table.id, seat.id)) {
+        await unwatchSeat(slug, business.businessId, table.id, seat.id);
+      } else {
+        const result = await watchSeat(
+          { slug, businessId: business.businessId, placeName: business.name },
+          { id: table.id, name: table.name },
+          seat.id,
+        );
+
+        if (result === "signin") {
+          router.push("/login");
+        } else if (result !== "ok") {
+          setWatchProblem(result);
+        }
+      }
+    } catch (seatError) {
+      console.error("Seat alert error:", seatError);
+      setWatchProblem("error");
+    } finally {
+      setBusySeatKey("");
+    }
+  }
+
   // -------------------------
   // DIRECTIONS
   // -------------------------
@@ -1242,6 +1292,9 @@ export default function PlaceScreen() {
                           table.id !== selectedTableId
                         }
                         onPress={() => toggleTable(table.id)}
+                        isSeatWatched={(seat) =>
+                          isWatchingSeat(slug, table.id, seat.id)
+                        }
                       />
                     ))}
                   </View>
@@ -1256,6 +1309,12 @@ export default function PlaceScreen() {
             <SelectedTableCard
               table={selectedTable}
               onClose={() => toggleTable(selectedTable.id)}
+              isSeatWatched={(seat) =>
+                isWatchingSeat(slug, selectedTable.id, seat.id)
+              }
+              busySeatKey={busySeatKey}
+              onSeatPress={(seat) => toggleSeatWatch(selectedTable, seat)}
+              problem={watchProblem}
             />
           ) : (
             tables.length > 0 && (
@@ -1440,6 +1499,7 @@ function TableView({
   selected,
   dimmed,
   onPress,
+  isSeatWatched,
 }: {
   table: Table;
   bounds: Bounds;
@@ -1447,6 +1507,7 @@ function TableView({
   selected: boolean;
   dimmed: boolean;
   onPress: () => void;
+  isSeatWatched: (seat: Seat) => boolean;
 }) {
   const isRound = table.shape === "round";
 
@@ -1541,6 +1602,10 @@ function TableView({
                 borderWidth: seatSize >= 14 ? 2 : 1,
                 backgroundColor: isFree ? C.free : C.taken,
               },
+              // Seat you asked to be notified about
+              isSeatWatched(seat)
+                ? { borderColor: C.dark, borderWidth: seatSize >= 14 ? 3 : 2 }
+                : null,
             ]}
           >
             {showSeatNumbers && (
@@ -1567,11 +1632,21 @@ function TableView({
 function SelectedTableCard({
   table,
   onClose,
+  isSeatWatched,
+  busySeatKey,
+  onSeatPress,
+  problem,
 }: {
   table: Table;
   onClose: () => void;
+  isSeatWatched: (seat: Seat) => boolean;
+  busySeatKey: string;
+  onSeatPress: (seat: Seat) => void;
+  problem: string;
 }) {
   const free = table.seats.filter((seat) => seat.status === "available").length;
+  const hasTakenSeats = free < table.seats.length;
+  const watchingAny = table.seats.some((seat) => isSeatWatched(seat));
 
   return (
     <View style={[styles.card, styles.selectedCard]}>
@@ -1603,34 +1678,91 @@ function SelectedTableCard({
       <View style={styles.seatChips}>
         {table.seats.map((seat, index) => {
           const isFree = seat.status === "available";
+          const watched = isSeatWatched(seat);
+          const busy = busySeatKey === `${table.id}|${seat.id}`;
 
+          // Free seats: just a label
+          if (isFree) {
+            return (
+              <View
+                key={`${table.id}-chip-${seat.id}-${index}`}
+                style={[styles.seatChip, { backgroundColor: C.freeSoft }]}
+              >
+                <View style={[styles.seatChipDot, { backgroundColor: C.free }]} />
+                <Text style={[styles.seatChipText, { color: C.freeText }]}>
+                  Seat {seat.id}
+                </Text>
+              </View>
+            );
+          }
+
+          // Taken seats: tap to get notified when this one opens
           return (
-            <View
+            <PressableScale
               key={`${table.id}-chip-${seat.id}-${index}`}
+              onPress={() => onSeatPress(seat)}
+              disabled={busy}
               style={[
                 styles.seatChip,
-                { backgroundColor: isFree ? C.freeSoft : C.takenSoft },
+                { backgroundColor: C.takenSoft },
+                watched ? styles.seatChipWatched : null,
               ]}
             >
-              <View
-                style={[
-                  styles.seatChipDot,
-                  { backgroundColor: isFree ? C.free : C.taken },
-                ]}
-              />
+              {busy ? (
+                <ActivityIndicator
+                  size="small"
+                  color={watched ? "#FFFFFF" : C.takenText}
+                  style={{ marginRight: 6, transform: [{ scale: 0.7 }] }}
+                />
+              ) : (
+                <Ionicons
+                  name={watched ? "notifications" : "notifications-outline"}
+                  size={13}
+                  color={watched ? "#FFFFFF" : C.takenText}
+                  style={{ marginRight: 5 }}
+                />
+              )}
 
               <Text
                 style={[
                   styles.seatChipText,
-                  { color: isFree ? C.freeText : C.takenText },
+                  { color: watched ? "#FFFFFF" : C.takenText },
                 ]}
               >
                 Seat {seat.id}
               </Text>
-            </View>
+            </PressableScale>
           );
         })}
       </View>
+
+      {hasTakenSeats && (
+        <Text style={styles.seatHint}>
+          {watchingAny
+            ? "We'll notify you when your seat opens. Tap it again to turn off."
+            : "Want a specific seat? Tap a taken seat to get notified when it opens."}
+        </Text>
+      )}
+
+      {problem !== "" && (
+        <View style={styles.watchProblem}>
+          <Text style={styles.watchProblemText}>
+            {problem === "denied"
+              ? "Notifications are turned off for SeatMate."
+              : problem === "simulator"
+                ? "Notifications only work on a real phone."
+                : problem === "not-configured"
+                  ? "Notifications aren't set up in this build yet."
+                  : "We couldn't turn on the alert. Please try again."}
+          </Text>
+
+          {problem === "denied" && (
+            <PressableScale onPress={() => Linking.openSettings()}>
+              <Text style={styles.watchSettingsLink}>Open Settings</Text>
+            </PressableScale>
+          )}
+        </View>
+      )}
     </View>
   );
 }
@@ -2120,6 +2252,10 @@ const styles = StyleSheet.create({
   seatChipDot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
 
   seatChipText: { fontSize: 13, fontWeight: "600" },
+
+  seatChipWatched: { backgroundColor: C.dark },
+
+  seatHint: { marginTop: 4, fontSize: 13, lineHeight: 18, color: C.textMuted },
 
   // OPEN TABLES
 
