@@ -35,6 +35,9 @@ EXPO_PUBLIC_FIREBASE_APP_ID=...
 
 ## Seat notifications ("Notify me when a seat opens")
 
+**Currently switched off** (`SEAT_ALERTS_ENABLED` in `src/lib/features.ts`).
+Turn it on after the function below is deployed.
+
 The app saves what you're waiting for on `users/{uid}`, and a Firebase Cloud
 Function (`functions/index.js`) sends the notification when staff mark a seat
 open, even if the app is closed.

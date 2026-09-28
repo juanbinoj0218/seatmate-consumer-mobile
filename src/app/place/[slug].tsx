@@ -23,6 +23,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { collection, doc, getDoc, onSnapshot } from "firebase/firestore";
 
 import { bumpPlaceStat, useAccount } from "../../lib/account";
+import { SEAT_ALERTS_ENABLED } from "../../lib/features";
 import { db } from "../../lib/firebase";
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -1086,7 +1087,7 @@ export default function PlaceScreen() {
 
           {/* NOTIFY ME WHEN A SEAT OPENS */}
 
-          {(noRoom || watching) && (
+          {SEAT_ALERTS_ENABLED && (noRoom || watching) && (
             <View style={styles.watchCard}>
               <View style={styles.watchHeader}>
                 <View
@@ -1681,15 +1682,28 @@ function SelectedTableCard({
           const watched = isSeatWatched(seat);
           const busy = busySeatKey === `${table.id}|${seat.id}`;
 
-          // Free seats: just a label
-          if (isFree) {
+          // Free seats (and all seats while alerts are off): just a label
+          if (isFree || !SEAT_ALERTS_ENABLED) {
             return (
               <View
                 key={`${table.id}-chip-${seat.id}-${index}`}
-                style={[styles.seatChip, { backgroundColor: C.freeSoft }]}
+                style={[
+                  styles.seatChip,
+                  { backgroundColor: isFree ? C.freeSoft : C.takenSoft },
+                ]}
               >
-                <View style={[styles.seatChipDot, { backgroundColor: C.free }]} />
-                <Text style={[styles.seatChipText, { color: C.freeText }]}>
+                <View
+                  style={[
+                    styles.seatChipDot,
+                    { backgroundColor: isFree ? C.free : C.taken },
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.seatChipText,
+                    { color: isFree ? C.freeText : C.takenText },
+                  ]}
+                >
                   Seat {seat.id}
                 </Text>
               </View>
@@ -1736,7 +1750,7 @@ function SelectedTableCard({
         })}
       </View>
 
-      {hasTakenSeats && (
+      {SEAT_ALERTS_ENABLED && hasTakenSeats && (
         <Text style={styles.seatHint}>
           {watchingAny
             ? "We'll notify you when your seat opens. Tap it again to turn off."
